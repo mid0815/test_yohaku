@@ -122,6 +122,9 @@ private enum CameraFilterMode: CaseIterable {
     case original
     case grayscale
     case grayscaleEdge
+    case grayscaleEdgeBlur
+    case motionEdge
+    case edgePersistence
     case blur
     case sepia
 
@@ -132,7 +135,13 @@ private enum CameraFilterMode: CaseIterable {
         case .grayscale:
             "Grayscale"
         case .grayscaleEdge:
-            "Grayscale + Edge"
+            "Edge"
+        case .grayscaleEdgeBlur:
+            "Grayscale + Edge + Blur"
+        case .motionEdge:
+            "Motion Edge"
+        case .edgePersistence:
+            "Edge Persistence"
         case .blur:
             "Blur"
         case .sepia:
@@ -295,6 +304,11 @@ private final class CameraManager: NSObject, ObservableObject {
     private let videoOutput = AVCaptureVideoDataOutput()
     private let ciContext = CIContext()
     private let sessionQueue = DispatchQueue(label: "jp.masaru.test-yohaku.camera-session")
+    private var frameCount = 0
+    private var previousLuminanceSamples: [UInt8]?
+    private var smoothedMotion: CGFloat = 1
+    private var visualMotion: CGFloat = 1
+    private var edgeHistory: [CGImage] = []
 
     override init() {
         super.init()
@@ -324,6 +338,7 @@ private final class CameraManager: NSObject, ObservableObject {
 
     func cycleFilter() {
         filterMode = filterMode.next
+        resetTemporalEffects()
     }
 
     private func configureAndStartSession() {
@@ -370,6 +385,9 @@ private final class CameraManager: NSObject, ObservableObject {
             session.addInput(input)
 
             videoOutput.alwaysDiscardsLateVideoFrames = true
+            videoOutput.videoSettings = [
+                kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA
+            ]
             videoOutput.setSampleBufferDelegate(self, queue: .main)
             guard session.canAddOutput(videoOutput) else {
                 message = "カメラ映像の出力を追加できません。"
@@ -391,9 +409,10 @@ extension CameraManager: AVCaptureVideoDataOutputSampleBufferDelegate {
         from connection: AVCaptureConnection
     ) {
         guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
+        frameCount += 1
 
         let sourceImage = CIImage(cvPixelBuffer: pixelBuffer)
-        let filteredImage = applyFilter(to: sourceImage)
+        let filteredImage = applyFilter(to: sourceImage, pixelBuffer: pixelBuffer)
         guard let cgImage = ciContext.createCGImage(filteredImage, from: filteredImage.extent) else {
             return
         }
@@ -401,17 +420,20 @@ extension CameraManager: AVCaptureVideoDataOutputSampleBufferDelegate {
         processedImage = UIImage(cgImage: cgImage, scale: 1, orientation: .right)
     }
 
-    private func applyFilter(to image: CIImage) -> CIImage {
+    private func applyFilter(to image: CIImage, pixelBuffer: CVPixelBuffer) -> CIImage {
         switch filterMode {
         case .original:
             image
         case .grayscale:
             grayscale(image)
         case .grayscaleEdge:
-            grayscale(image).applyingFilter(
-                "CIEdges",
-                parameters: [kCIInputIntensityKey: 6]
-            )
+            edgeImage(from: grayscale(image), intensity: 6, blurRadius: 0)
+        case .grayscaleEdgeBlur:
+            grayscaleEdgeBlurImage(from: image)
+        case .motionEdge:
+            motionEdgeImage(from: image, pixelBuffer: pixelBuffer)
+        case .edgePersistence:
+            edgePersistenceImage(from: image)
         case .blur:
             image.applyingFilter(
                 "CIGaussianBlur",
@@ -432,6 +454,259 @@ extension CameraManager: AVCaptureVideoDataOutputSampleBufferDelegate {
             parameters: [kCIInputSaturationKey: 0]
         )
     }
+
+    private func grayscaleEdgeBlurImage(from image: CIImage) -> CIImage {
+        let grayscaleImage = grayscale(image)
+        let edge = edgeImage(
+            from: grayscaleImage,
+            intensity: MotionEdgeSettings.baseEdgeIntensity,
+            blurRadius: MotionEdgeSettings.baseEdgeBlurRadius
+        )
+        return composite(
+            background: grayscaleImage,
+            backgroundStrength: MotionEdgeSettings.baseBackgroundStrength,
+            edge: edge,
+            edgeStrength: MotionEdgeSettings.baseEdgeStrength
+        )
+    }
+
+    private func motionEdgeImage(from image: CIImage, pixelBuffer: CVPixelBuffer) -> CIImage {
+        let motion = updateMotion(using: pixelBuffer)
+        let grayscaleImage = grayscale(image)
+        let edge = edgeImage(
+            from: grayscaleImage,
+            intensity: MotionEdgeSettings.baseEdgeIntensity,
+            blurRadius: interpolate(
+                MotionEdgeSettings.stillEdgeBlurRadius,
+                MotionEdgeSettings.movingEdgeBlurRadius,
+                by: motion
+            )
+        )
+        let temporallySmoothedEdge = edgeWithHistory(
+            edge,
+            maximumHistoryCount: 1,
+            historyStrength: MotionEdgeSettings.motionEdgeHistoryStrength
+        )
+        return composite(
+            background: grayscaleImage,
+            backgroundStrength: interpolate(
+                MotionEdgeSettings.stillBackgroundStrength,
+                MotionEdgeSettings.movingBackgroundStrength,
+                by: motion
+            ),
+            edge: temporallySmoothedEdge,
+            edgeStrength: interpolate(
+                MotionEdgeSettings.stillEdgeStrength,
+                MotionEdgeSettings.movingEdgeStrength,
+                by: motion
+            )
+        )
+    }
+
+    private func edgePersistenceImage(from image: CIImage) -> CIImage {
+        let grayscaleImage = grayscale(image)
+        let edge = edgeImage(
+            from: grayscaleImage,
+            intensity: MotionEdgeSettings.baseEdgeIntensity,
+            blurRadius: MotionEdgeSettings.persistenceEdgeBlurRadius
+        )
+        let persistentEdge = edgeWithHistory(
+            edge,
+            maximumHistoryCount: MotionEdgeSettings.persistenceHistoryCount,
+            historyStrength: MotionEdgeSettings.persistenceHistoryStrength
+        )
+        return composite(
+            background: grayscaleImage,
+            backgroundStrength: MotionEdgeSettings.persistenceBackgroundStrength,
+            edge: persistentEdge,
+            edgeStrength: MotionEdgeSettings.persistenceEdgeStrength
+        )
+    }
+
+    private func edgeImage(from image: CIImage, intensity: CGFloat, blurRadius: CGFloat) -> CIImage {
+        let edge = image.applyingFilter(
+            "CIEdges",
+            parameters: [kCIInputIntensityKey: intensity]
+        )
+        guard blurRadius > 0 else { return edge }
+        return edge.applyingFilter(
+            "CIGaussianBlur",
+            parameters: [kCIInputRadiusKey: blurRadius]
+        )
+        .cropped(to: image.extent)
+    }
+
+    private func composite(
+        background: CIImage,
+        backgroundStrength: CGFloat,
+        edge: CIImage,
+        edgeStrength: CGFloat
+    ) -> CIImage {
+        scaledIntensity(edge, by: edgeStrength).applyingFilter(
+            "CIAdditionCompositing",
+            parameters: [kCIInputBackgroundImageKey: scaledIntensity(background, by: backgroundStrength)]
+        )
+    }
+
+    private func scaledIntensity(_ image: CIImage, by amount: CGFloat) -> CIImage {
+        image.applyingFilter(
+            "CIColorMatrix",
+            parameters: [
+                "inputRVector": CIVector(x: amount, y: 0, z: 0, w: 0),
+                "inputGVector": CIVector(x: 0, y: amount, z: 0, w: 0),
+                "inputBVector": CIVector(x: 0, y: 0, z: amount, w: 0),
+                "inputAVector": CIVector(x: 0, y: 0, z: 0, w: 1)
+            ]
+        )
+    }
+
+    private func updateMotion(using pixelBuffer: CVPixelBuffer) -> CGFloat {
+        guard frameCount.isMultiple(of: MotionEdgeSettings.motionAnalysisFrameInterval),
+              let samples = luminanceSamples(from: pixelBuffer) else {
+            return visualMotion
+        }
+
+        defer { previousLuminanceSamples = samples }
+        guard let previousLuminanceSamples else { return visualMotion }
+
+        let meanDifference = zip(samples, previousLuminanceSamples).reduce(CGFloat.zero) { sum, pair in
+            sum + abs(CGFloat(pair.0) - CGFloat(pair.1))
+        } / CGFloat(samples.count * 255)
+        let normalizedMotion = clamp(
+            (meanDifference - MotionEdgeSettings.motionNoiseFloor) /
+                (MotionEdgeSettings.motionFullScale - MotionEdgeSettings.motionNoiseFloor)
+        )
+        smoothedMotion += (normalizedMotion - smoothedMotion) * MotionEdgeSettings.motionSmoothing
+        visualMotion += (smoothedMotion - visualMotion) * MotionEdgeSettings.visualSmoothing
+        return visualMotion
+    }
+
+    private func luminanceSamples(from pixelBuffer: CVPixelBuffer) -> [UInt8]? {
+        guard CVPixelBufferGetPixelFormatType(pixelBuffer) == kCVPixelFormatType_32BGRA else {
+            return nil
+        }
+
+        CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly) }
+        guard let baseAddress = CVPixelBufferGetBaseAddress(pixelBuffer) else { return nil }
+
+        let width = CVPixelBufferGetWidth(pixelBuffer)
+        let height = CVPixelBufferGetHeight(pixelBuffer)
+        let bytesPerRow = CVPixelBufferGetBytesPerRow(pixelBuffer)
+        guard width > 0, height > 0 else { return nil }
+
+        let pixels = baseAddress.assumingMemoryBound(to: UInt8.self)
+        var samples: [UInt8] = []
+        samples.reserveCapacity(MotionEdgeSettings.motionSampleColumns * MotionEdgeSettings.motionSampleRows)
+
+        for sampleY in 0 ..< MotionEdgeSettings.motionSampleRows {
+            let y = min(height - 1, sampleY * height / MotionEdgeSettings.motionSampleRows)
+            for sampleX in 0 ..< MotionEdgeSettings.motionSampleColumns {
+                let x = min(width - 1, sampleX * width / MotionEdgeSettings.motionSampleColumns)
+                let offset = y * bytesPerRow + x * 4
+                let blue = UInt16(pixels[offset])
+                let green = UInt16(pixels[offset + 1])
+                let red = UInt16(pixels[offset + 2])
+                samples.append(UInt8((red * 77 + green * 150 + blue * 29) >> 8))
+            }
+        }
+        return samples
+    }
+
+    private func edgeWithHistory(
+        _ edge: CIImage,
+        maximumHistoryCount: Int,
+        historyStrength: CGFloat
+    ) -> CIImage {
+        var combinedEdge = edge
+        for (index, historyImage) in edgeHistory.prefix(maximumHistoryCount).enumerated() {
+            let decay = pow(MotionEdgeSettings.historyDecay, CGFloat(index + 1))
+            let restoredEdge = CIImage(cgImage: historyImage)
+                .transformed(by: CGAffineTransform(
+                    scaleX: 1 / MotionEdgeSettings.historyImageScale,
+                    y: 1 / MotionEdgeSettings.historyImageScale
+                ))
+                .cropped(to: edge.extent)
+            combinedEdge = scaledIntensity(restoredEdge, by: historyStrength * decay)
+                .applyingFilter(
+                    "CIAdditionCompositing",
+                    parameters: [kCIInputBackgroundImageKey: combinedEdge]
+                )
+        }
+
+        storeEdgeInHistory(edge, maximumCount: maximumHistoryCount)
+        return combinedEdge
+    }
+
+    private func storeEdgeInHistory(_ edge: CIImage, maximumCount: Int) {
+        guard frameCount.isMultiple(of: MotionEdgeSettings.historyCaptureFrameInterval) else {
+            return
+        }
+
+        let scaledExtent = edge.extent.applying(
+            CGAffineTransform(
+                scaleX: MotionEdgeSettings.historyImageScale,
+                y: MotionEdgeSettings.historyImageScale
+            )
+        )
+        let scaledEdge = edge.transformed(by: CGAffineTransform(
+            scaleX: MotionEdgeSettings.historyImageScale,
+            y: MotionEdgeSettings.historyImageScale
+        ))
+        .cropped(to: scaledExtent)
+        guard let image = ciContext.createCGImage(scaledEdge, from: scaledExtent) else { return }
+
+        edgeHistory.insert(image, at: 0)
+        edgeHistory = Array(edgeHistory.prefix(maximumCount))
+    }
+
+    private func resetTemporalEffects() {
+        frameCount = 0
+        previousLuminanceSamples = nil
+        smoothedMotion = 1
+        visualMotion = 1
+        edgeHistory = []
+    }
+
+    private func interpolate(_ start: CGFloat, _ end: CGFloat, by amount: CGFloat) -> CGFloat {
+        start + (end - start) * clamp(amount)
+    }
+
+    private func clamp(_ value: CGFloat) -> CGFloat {
+        min(max(value, 0), 1)
+    }
+}
+
+private enum MotionEdgeSettings {
+    static let motionSampleColumns = 32
+    static let motionSampleRows = 24
+    static let motionAnalysisFrameInterval = 2
+    static let motionNoiseFloor: CGFloat = 0.012
+    static let motionFullScale: CGFloat = 0.10
+    static let motionSmoothing: CGFloat = 0.18
+    static let visualSmoothing: CGFloat = 0.08
+
+    static let baseEdgeIntensity: CGFloat = 5
+    static let baseBackgroundStrength: CGFloat = 0.55
+    static let baseEdgeStrength: CGFloat = 0.75
+    static let baseEdgeBlurRadius: CGFloat = 2.2
+
+    static let stillBackgroundStrength: CGFloat = 0.16
+    static let movingBackgroundStrength: CGFloat = 0.82
+    static let stillEdgeStrength: CGFloat = 0.95
+    static let movingEdgeStrength: CGFloat = 0.18
+    static let stillEdgeBlurRadius: CGFloat = 0.8
+    static let movingEdgeBlurRadius: CGFloat = 4.5
+    static let motionEdgeHistoryStrength: CGFloat = 0.22
+
+    static let persistenceBackgroundStrength: CGFloat = 0.28
+    static let persistenceEdgeStrength: CGFloat = 0.72
+    static let persistenceEdgeBlurRadius: CGFloat = 1.5
+    static let persistenceHistoryCount = 4
+    static let persistenceHistoryStrength: CGFloat = 0.28
+    static let historyDecay: CGFloat = 0.62
+    static let historyImageScale: CGFloat = 0.25
+    static let historyCaptureFrameInterval = 3
 }
 
 #else
